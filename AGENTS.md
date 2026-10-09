@@ -14,11 +14,13 @@ An OpenCode 2 plugin, published to npm as `opencode-smart-compaction`, that writ
 - Target the OpenCode 2 plugin API only (`{ id, setup }`); do not add a V1 `server()` entrypoint.
 - Import only types from `@opencode/plugin`. It stays a dev and optional peer dependency, never a runtime dependency.
 - The hook fails open: when every model attempt errors or returns a summary without all six sections, leave `event.result` unset so OpenCode compacts with its own prompt.
-- `src/prompt.ts` and `src/git-state.ts` mirror the Pi extension (`shariq-pi-extensions/extensions/smart-compaction`). A change to the checkpoint format or protected-fact rules belongs in both. Transcript serialization (`src/session.ts`) and the threshold (`src/threshold.ts`) are OpenCode-specific; the 600,000-token hard limit deliberately differs from Pi's 400,000.
+- The plugin started as a port of the Pi Smart Compaction extension but is maintained on its own. Change the prompts, checkpoint format, and appended state for OpenCode alone; there is no second copy to keep in step.
+- `src/subagents.ts` reads the stored session messages from `ctx.session.context`: the `subagent` tool part's `metadata.status`/`metadata.sessionID` and the synthetic completion message's `metadata.source`/`metadata.childID`. Recheck those fields on every OpenCode upgrade.
 - `src/session.ts` parses text OpenCode generates (paths in the OpenCode repository): the checkpoint wrapper (`packages/core/src/session/runner/to-llm-message.ts`) and the recent-context lines (`messageToText` in `packages/core/src/session/compaction.ts`). Recheck both on every OpenCode upgrade; the full checklist is in `docs/DEVELOPMENT.md`.
+- `src/recent.ts` must only trim a checkpoint whose kept turns were included in its summary. Check request message IDs, stored message shapes, checkpoint rendering, and copy semantics on OpenCode upgrades; never change stored history to bound requests.
 - The 95% threshold only works when OpenCode's `compaction.buffer` is below 5% of the window; keep the README's buffer guidance in step with any threshold change.
 - Prompt strings contain literal XML-style tags. Verify them with `grep` on the file, since some editing tools hide them in their display.
-- Test live against the published npm package, not a local path.
+- Test releases live against the published npm package. For an unreleased branch, use an installed Git package so entrypoint resolution is exercised; a local re-export wrapper alone doesn't check packaging.
 
 ## Releases
 

@@ -4,8 +4,7 @@
  * The prompt carries the whole request: the directives, the conversation being
  * summarized, the previous checkpoint, and the protected facts. After the model
  * writes the summary, completeSummary restores any protected identifier the
- * model dropped and appends the exact file and worktree state, as the Pi
- * extension does.
+ * model dropped and appends the exact file and worktree state.
  */
 
 import {
@@ -40,7 +39,7 @@ const CONVERSATION_CLOSE = "</conversation>";
 
 // Everything from the first appended state block on is regenerated each time,
 // so it is not fed back to the model as part of the previous checkpoint.
-const APPENDED_STATE = /\n\n<(?:read-files|touched-files|uncommitted-dirty-files|modified-lockfiles-and-assets|active-background-processes|uncommitted-diff|uncommitted-state-unavailable)\b/i;
+const APPENDED_STATE = /\n\n<(?:read-files|touched-files|uncommitted-dirty-files|modified-lockfiles-and-assets|active-background-processes|running-subagents|uncommitted-diff|uncommitted-state-unavailable|recent-context-summarized)\b/i;
 
 export function semanticSummary(summary: string): string {
   return summary.split(APPENDED_STATE)[0]!.trim();
@@ -52,7 +51,19 @@ export interface Checkpoint {
   appendix: string;
 }
 
-export function buildCheckpoint(facts: SessionFacts, git: GitEngineeringState, backgroundProcesses: string[] = []): Checkpoint {
+/** Session state appended after the summary beside the file and worktree state. */
+export interface CheckpointState {
+  backgroundProcesses?: string[];
+  runningSubagents?: string[];
+  /** The summary also covers the turns OpenCode keeps verbatim, so the recent context may be shortened in requests. */
+  recentSummarized?: boolean;
+}
+
+export function buildCheckpoint(
+  facts: SessionFacts,
+  git: GitEngineeringState,
+  { backgroundProcesses = [], runningSubagents = [], recentSummarized = false }: CheckpointState = {},
+): Checkpoint {
   const previousSummary = facts.previousSummary ? semanticSummary(facts.previousSummary) : undefined;
   const protectedFacts = extractProtectedFacts(facts.userTexts, previousSummary);
 
@@ -76,6 +87,8 @@ export function buildCheckpoint(facts: SessionFacts, git: GitEngineeringState, b
     dirtyStateAvailable: git.available,
     lockfilesAndGeneratedAssets: git.lockfilesAndGeneratedAssets,
     activeBackgroundProcesses: backgroundProcesses,
+    runningSubagents,
+    recentSummarized,
   });
 
   return { prompt: sections.join("\n\n"), protectedFacts, appendix };

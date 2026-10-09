@@ -1,6 +1,6 @@
 {
   "name": "opencode-smart-compaction",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Smart Compaction for OpenCode 2: structured six-section checkpoints with protected identifiers and exact file and worktree state.",
   "license": "MIT",
   "author": "Shariq Riaz",

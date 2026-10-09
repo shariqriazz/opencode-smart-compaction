@@ -9,12 +9,13 @@ import type { SessionCompaction } from "@opencode/plugin/promise/session";
 type Message = SessionCompaction["messages"][number];
 
 // Tag names are assembled so the literal markup never appears in this source.
-const tag = (name: string, close = false) => `<${close ? "/" : ""}${name}>`;
-const CHECKPOINT_OPEN = tag("conversation-checkpoint");
+export const tag = (name: string, close = false) => `<${close ? "/" : ""}${name}>`;
+export const CHECKPOINT_OPEN = tag("conversation-checkpoint");
 const SUMMARY_OPEN = tag("summary");
-const SUMMARY_CLOSE = tag("summary", true);
-const RECENT_OPEN = `${SUMMARY_CLOSE}\n\n${tag("recent-context")}\n`;
-const RECENT_CLOSE = `\n${tag("recent-context", true)}`;
+export const SUMMARY_CLOSE = tag("summary", true);
+export const RECENT_OPEN = `${SUMMARY_CLOSE}\n\n${tag("recent-context")}\n`;
+export const RECENT_CLOSE = `\n${tag("recent-context", true)}`;
+export const RECENT_SUMMARIZED_TAG = "recent-context-summarized";
 // A user turn in OpenCode's serialized recent context runs until the next speaker label.
 const RECENT_USER_TURN =
   /^\[User\]: ([\s\S]*?)(?=^\[(?:User|Assistant|Assistant reasoning|Assistant tool call|Tool result|Tool error|Shell|Synthetic context|Skill activated: [^\]\n]*|Attached [^\]\n]*)\]|(?![\s\S]))/gm;
@@ -29,6 +30,20 @@ const RECENT_TOOL_CALL = /^\[Assistant tool call\]: (read|edit|write|patch)\((.*
 const RECENT_MESSAGES = 14;
 const LARGE_ARGUMENT_CHARS = 1_200;
 const LARGE_ARGUMENT_KEYS = /^(?:content|text|oldText|newText|oldString|newString|patch|patchText|input|data)$/i;
+// The appended file lists carry over across compactions; keep only the most recently used paths so they stay bounded.
+const MAX_READ_FILES = 40;
+const MAX_MODIFIED_FILES = 60;
+
+/** Moves a path to the most-recent end of an insertion-ordered set. */
+function touchPath(paths: Set<string>, file: string): void {
+  paths.delete(file);
+  paths.add(file);
+}
+
+/** The most recently used paths, oldest first, so a carried-over list keeps its recency order. */
+function newestPaths(paths: Iterable<string>, limit: number): string[] {
+  return [...paths].slice(-limit);
+}
 
 export interface SessionFacts {
   userTexts: string[];
@@ -45,6 +60,11 @@ function textOf(message: Message): string {
   return message.content
     .flatMap((part) => (part.type === "text" && part.text.trim() ? [part.text.trim()] : []))
     .join("\n");
+}
+
+/** Whether a checkpoint summary marks its recent context as already summarized, so it isn't summarized again. */
+export function summarizesRecent(summary: string | undefined): boolean {
+  return summary?.includes(`\n${tag(RECENT_SUMMARIZED_TAG)}\n`) ?? false;
 }
 
 export interface PreviousCheckpoint {
@@ -197,8 +217,8 @@ const unescapeXml = (text: string) =>
     .replace(/&apos;/g, "'")
     .replace(/&amp;/g, "&");
 
-/** A file list the plugin appended to a previous checkpoint, so file activity accumulates across compactions. */
-function appendedFileList(summary: string | undefined, name: string): string[] {
+/** A list the plugin appended to a previous checkpoint, so file activity and running subagents carry across compactions. */
+export function appendedList(summary: string | undefined, name: string): string[] {
   const block = summary?.match(new RegExp(`\\n${tag(name)}\\n([\\s\\S]*?)\\n${tag(name, true)}`))?.[1];
   return block ? block.split("\n").map(unescapeXml).filter(Boolean) : [];
 }
@@ -237,7 +257,7 @@ export function readSessionFacts(messages: readonly Message[]): SessionFacts {
         if (checkpoint.recent) {
           userTexts.push(...recentUserTexts(checkpoint.recent));
           calls.push(...recentToolCalls(checkpoint.recent));
-          lines.push(checkpoint.recent);
+          if (!summarizesRecent(checkpoint.summary)) lines.push(checkpoint.recent);
         }
         continue;
       }
@@ -247,29 +267,30 @@ export function readSessionFacts(messages: readonly Message[]): SessionFacts {
     if (line) lines.push(line);
   }
 
-  const read = new Set(appendedFileList(previousSummary, "read-files"));
-  const modified = new Set(appendedFileList(previousSummary, "touched-files"));
+  const read = new Set(appendedList(previousSummary, "read-files"));
+  const modified = new Set(appendedList(previousSummary, "touched-files"));
   for (const call of calls) {
     if (call.id !== undefined && failed.has(call.id)) continue;
     if (READ_TOOLS.has(call.name)) {
       const file = stringField(call.input, "path");
-      if (file) read.add(file);
+      if (file) touchPath(read, file);
     } else if (WRITE_TOOLS.has(call.name)) {
       const file = stringField(call.input, "path");
-      if (file) modified.add(file);
+      if (file) touchPath(modified, file);
     } else if (call.name === "patch") {
       for (const match of (stringField(call.input, "patchText") ?? "").matchAll(PATCH_FILE_LINE)) {
         const file = (match[1] ?? match[2])?.trim();
-        if (file) modified.add(file);
+        if (file) touchPath(modified, file);
       }
     }
   }
 
+  const modifiedFiles = newestPaths(modified, MAX_MODIFIED_FILES);
   return {
     userTexts,
     previousSummary,
-    readFiles: [...read].filter((file) => !modified.has(file)).sort(),
-    modifiedFiles: [...modified].sort(),
+    readFiles: newestPaths([...read].filter((file) => !modifiedFiles.includes(file)), MAX_READ_FILES),
+    modifiedFiles,
     transcript: lines.join("\n\n"),
   };
 }
