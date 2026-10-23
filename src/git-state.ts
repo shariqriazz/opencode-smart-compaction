@@ -66,6 +66,7 @@ function patchChunkPath(chunk: string): string | undefined {
 }
 
 function truncatePatch(text: string, files: DirtyFileState[]): string {
+  if (!text && files.length === 0) return "";
   const inventory = files.map((file) => `${file.status} ${file.path}`).join("\n");
   const inventoryBlock = `## Changed-file inventory\n${inventory}\n`;
   if (inventoryBlock.length >= DIRTY_PATCH_CHARS) {

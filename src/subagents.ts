@@ -1,6 +1,6 @@
 import type { Plugin } from "@opencode/plugin";
 import { UNVERIFIED_SUBAGENTS_NOTE } from "./prompt.ts";
-import { appendedList } from "./session.ts";
+import { appendedList, storedRecent } from "./session.ts";
 
 export type ContextMessage = Awaited<ReturnType<Plugin.Context["session"]["context"]>>[number];
 
@@ -83,7 +83,7 @@ export function runningSubagents(
       forgetReports(message.text);
     } else if (!carriedVerified && message.type === "compaction" && message.status === "completed") {
       forgetReports(message.summary);
-      forgetReports(message.recent);
+      forgetReports(storedRecent(message));
     }
   }
   return [...running.values()];

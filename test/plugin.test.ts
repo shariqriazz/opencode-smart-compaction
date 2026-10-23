@@ -204,6 +204,7 @@ test("git state covers tracked diffs and bounded untracked previews, never follo
     fs.writeFileSync(path.join(root, "tracked.ts"), "export const v = 1;\n");
     git("add", "tracked.ts");
     git("commit", "-qm", "init");
+    assert.equal((await getGitEngineeringState(root)).patch, "", "a clean worktree gets no empty diff block");
     fs.writeFileSync(path.join(root, "tracked.ts"), "export const v = 2;\n");
     fs.writeFileSync(path.join(root, "fresh.ts"), "export const fresh = true;\n");
     fs.writeFileSync(outside, "OUTSIDE-SECRET\n");
@@ -321,6 +322,9 @@ test("rendered checkpoint completion reports reconcile only unverified carried I
       assert.deepEqual(runningSubagents(checkpoint as never, carried, [], false), []);
       assert.deepEqual(runningSubagents(checkpoint as never, carried, [], true), carried);
     }
+    const checkpoint21 = [{ type: "compaction", status: "completed", summary: "", metadata: { keepID: "msg_1", recent: report } }];
+    assert.deepEqual(runningSubagents(checkpoint21 as never, carried, [], false), [], "OpenCode 2.1 keeps recent text in metadata");
+    assert.deepEqual(runningSubagents([{ type: "compaction", status: "completed", summary: "" }] as never, carried, [], false), carried);
     assert.deepEqual(runningSubagents([{ type: "synthetic", text: report }] as never, carried), [], "newer synthetic text still ends a verified carried entry");
     assert.deepEqual(runningSubagents([launch("ses_carried", "worker", "Resumed")] as never, carried, [report], false), [
       { sessionID: "ses_carried", agent: "worker", description: "Resumed" },
@@ -778,6 +782,9 @@ test("compaction lifecycle records do not prevent safe coverage of the kept conv
   assert.doesNotMatch(facts.transcript, /pending|running/, "the current empty placeholder is not a task to resume");
   assert.equal(adaptKeptMessages([{ ...tail[2], summary: "uncovered summary" }] as never).complete, false);
   assert.equal(adaptKeptMessages([{ ...tail[2], recent: "uncovered recent turns" }] as never).complete, false);
+  const { recent: _legacy, ...placeholder21 } = tail[2] as Record<string, unknown>;
+  assert.ok(adaptKeptMessages([placeholder21] as never).complete, "OpenCode 2.1 placeholders have no recent field");
+  assert.equal(adaptKeptMessages([{ ...placeholder21, metadata: { recent: "uncovered recent turns" } }] as never).complete, false);
 
   let prompt = "";
   const hooks = await loadHooks(async (input) => {

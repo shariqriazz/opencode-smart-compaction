@@ -9,7 +9,7 @@
  */
 
 import type { SessionCompaction } from "@opencode/plugin/promise/session";
-import { CHECKPOINT_OPEN, parseCheckpoint, RECENT_CLOSE, RECENT_OPEN, summarizesRecent, truncateHeadAndTail } from "./session.ts";
+import { CHECKPOINT_OPEN, parseCheckpoint, RECENT_CLOSE, RECENT_OPEN, storedRecent, summarizesRecent, truncateHeadAndTail } from "./session.ts";
 import type { ContextMessage } from "./subagents.ts";
 
 type Message = SessionCompaction["messages"][number];
@@ -72,7 +72,7 @@ export function adaptKeptMessages(stored: readonly ContextMessage[]): { messages
       case "compaction":
         // The current empty manual-compaction placeholder isn't conversation. Failed attempts carry an error;
         // completed checkpoints still need a boundary before their content can be covered.
-        if (message.status !== "failed" && !(message.status === "running" && !message.summary.trim() && !message.recent.trim())) complete = false;
+        if (message.status !== "failed" && !(message.status === "running" && !message.summary.trim() && !storedRecent(message).trim())) complete = false;
         return message.status === "failed"
           ? [text("assistant", `[Historical compaction failure]: ${message.error.type}: ${truncateHeadAndTail(message.error.message, 1_500, 1_500)}`)]
           : [];

@@ -62,6 +62,13 @@ function textOf(message: Message): string {
     .join("\n");
 }
 
+/** A stored compaction's kept text: OpenCode 2.0 stores `recent`; 2.1 rebuilds `metadata.recent` from `metadata.keepID`. */
+export function storedRecent(message: { metadata?: Record<string, unknown> }): string {
+  const legacy = (message as { recent?: unknown }).recent;
+  const value = typeof legacy === "string" ? legacy : message.metadata?.recent;
+  return typeof value === "string" ? value : "";
+}
+
 /** Whether a checkpoint summary marks its recent context as already summarized, so it isn't summarized again. */
 export function summarizesRecent(summary: string | undefined): boolean {
   return summary?.includes(`\n${tag(RECENT_SUMMARIZED_TAG)}\n`) ?? false;

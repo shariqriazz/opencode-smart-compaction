@@ -43,7 +43,7 @@ Publishing uses npm trusted publishing (OIDC), so the repository holds no npm to
 1. Raise `@opencode/plugin` in `devDependencies` and the `peerDependencies` floor, then run `bun install`.
 2. Check for changes that the plugin depends on:
    - `node_modules/@opencode/plugin/dist/promise/session.d.ts`: the `compaction` and mutable `context` hook events and `generate.text` input.
-   - The OpenCode checkpoint wrapper in `packages/core/src/session/runner/to-llm-message.ts` and `messageToText` in `packages/core/src/session/compaction.ts`, which the plugin parses.
+   - The OpenCode checkpoint wrapper in `packages/core/src/session/runner/to-llm-message.ts` and `messageToText` in `packages/core/src/session/recent-text.ts` (in `compaction.ts` before 2.1), which the plugin parses, and where stored compactions keep their recent text (`recent` in 2.0, `metadata.recent` rebuilt from `metadata.keepID` in 2.1).
    - `calculateCeiling` in `packages/core/src/session/compaction.ts`, which decides when OpenCode's own trigger fires relative to `compaction.buffer`.
    - The events the plugin reads: `session.step.started`, `session.step.ended`, `session.compaction.*`, `session.deleted`, `shell.created`, `shell.exited`, `shell.deleted`, `model.updated`, and `provider.updated`; and the shell tool's `metadata.sessionID`.
    - `ctx.session.context` and the stored message fields `src/subagents.ts` reads: the `subagent` tool part's `metadata.status` and `metadata.sessionID`, and the completion synthetic message's `metadata.source` and `metadata.childID` (written by the subagent background job in `packages/core`).
