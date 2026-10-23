@@ -5,6 +5,7 @@
  */
 
 import type { SessionCompaction } from "@opencode/plugin/promise/session";
+import { formatFileOperationsXml } from "./prompt.ts";
 
 type Message = SessionCompaction["messages"][number];
 
@@ -16,6 +17,7 @@ export const SUMMARY_CLOSE = tag("summary", true);
 export const RECENT_OPEN = `${SUMMARY_CLOSE}\n\n${tag("recent-context")}\n`;
 export const RECENT_CLOSE = `\n${tag("recent-context", true)}`;
 export const RECENT_SUMMARIZED_TAG = "recent-context-summarized";
+const RECENT_SUMMARIZED_SUFFIX = formatFileOperationsXml({ recentSummarized: true });
 // A user turn in OpenCode's serialized recent context runs until the next speaker label.
 const RECENT_USER_TURN =
   /^\[User\]: ([\s\S]*?)(?=^\[(?:User|Assistant|Assistant reasoning|Assistant tool call|Tool result|Tool error|Shell|Synthetic context|Skill activated: [^\]\n]*|Attached [^\]\n]*)\]|(?![\s\S]))/gm;
@@ -69,9 +71,9 @@ export function storedRecent(message: { metadata?: Record<string, unknown> }): s
   return typeof value === "string" ? value : "";
 }
 
-/** Whether a checkpoint summary marks its recent context as already summarized, so it isn't summarized again. */
+/** Only the exact final appendix block authorizes coverage; quoted markers elsewhere do not. */
 export function summarizesRecent(summary: string | undefined): boolean {
-  return summary?.includes(`\n${tag(RECENT_SUMMARIZED_TAG)}\n`) ?? false;
+  return summary?.trimEnd().endsWith(RECENT_SUMMARIZED_SUFFIX) ?? false;
 }
 
 export interface PreviousCheckpoint {

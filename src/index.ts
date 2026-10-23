@@ -1,7 +1,9 @@
 import type { Plugin } from "@opencode/plugin";
-import { buildCheckpoint, completeSummary, isCompleteSummary } from "./checkpoint.ts";
+import { cacheReusePlan, createCacheTracker } from "./cache.ts";
+import { buildCheckpoint, completeSummary, isCompleteSummary, stripAppendedState } from "./checkpoint.ts";
 import { subscribe } from "./events.ts";
 import { getGitEngineeringState } from "./git-state.ts";
+import { createModelLimits, modelKey, modelLabel, type ModelRef } from "./model-limits.ts";
 import { adaptKeptMessages, keptMessages, readMaxRecentTokens, trimRecentContext } from "./recent.ts";
 import { readSessionFacts } from "./session.ts";
 import { createShellTracker } from "./shells.ts";
@@ -21,7 +23,15 @@ async function readContext(ctx: Pick<Plugin.Context, "session">, sessionID: stri
   }
 }
 
-type ModelRef = NonNullable<Parameters<Plugin.Context["generate"]["text"]>[0]["model"]>;
+type Mode = "cached" | "stateless";
+interface Attempt {
+  mode: Mode;
+  model: string;
+  ms: number;
+  outcome: string;
+}
+const errorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error)).slice(0, 200);
+const attemptList = (attempts: Attempt[]) => attempts.map(({ mode, model, outcome }) => `${mode}/${model}: ${outcome}`).join("; ");
 
 /**
  * The models to try, in order: the compaction model with its variant, the same model with its default settings,
@@ -53,19 +63,26 @@ export function isFatalGenerationError(error: unknown): boolean {
  * has all six sections, completes it, and returns it as the hook result so
  * OpenCode skips its own summary request. If no attempt yields a complete
  * summary, the result stays unset and OpenCode compacts with its built-in
- * prompt. An event watcher adds the hybrid threshold and tracks running shells;
+ * prompt. A warm, matching session request is tried before stateless attempts.
+ * An event watcher adds the hybrid threshold and tracks cache usage and running shells;
  * background subagents that have not reported back are read from the session's context.
  * The checkpoint also summarizes the turns OpenCode keeps verbatim, and the
- * session `context` hook bounds that recent context in each request.
+ * session `context` and `generate` hooks bound that recent context in each request.
  */
 export default {
   id: PLUGIN_ID,
   async setup(ctx) {
     const shells = createShellTracker();
     const maxRecentTokens = readMaxRecentTokens(ctx.options);
+    const cacheReuse = ctx.options.cacheReuse !== false;
+    const cache = createCacheTracker();
+    const limits = createModelLimits(ctx);
+    const inFlight = new Map<string, { maxTokens: number; prompt: string; model: string }>();
 
     await ctx.session.hook("compaction", async (event) => {
       if (event.result) return;
+      const started = Date.now();
+      const attempts: Attempt[] = [];
       try {
         const context = await readContext(ctx, event.sessionID);
         // The turns OpenCode keeps verbatim are summarized too, so requests can carry only the newest of them.
@@ -84,24 +101,65 @@ export default {
           ], carriedVerified).map(formatSubagent),
           subagentsVerified: context !== undefined,
           recentSummarized: adapted?.complete === true,
+          cachedRecentSummarized: maxRecentTokens > 0,
         });
-        let problem = "no attempt was made";
-        for (const model of summaryModels(event.model, session.model)) {
+        const modelLimits = cacheReuse ? await limits.get(modelKey(event.model)).catch(() => undefined) : undefined;
+        const plan = cacheReusePlan({
+          enabled: cacheReuse,
+          model: event.model,
+          context,
+          step: cache.get(event.sessionID),
+          limits: modelLimits,
+          prompt: checkpoint.cachedPrompt,
+          now: Date.now(),
+        });
+        const skipped = typeof plan === "string" ? ` cache-reuse-skipped=${plan}` : "";
+        const attempt = async (mode: Mode, model: ModelRef, prompt: string, generate: () => Promise<{ text: string }>) => {
+          const start = Date.now();
+          const label = modelLabel(model);
           try {
-            const { text } = await ctx.generate.text({ prompt: checkpoint.prompt, model });
-            if (isCompleteSummary(text)) {
-              event.result = { summary: completeSummary(text, checkpoint) };
-              return;
-            }
-            problem = text.trim() ? "the summary was missing required sections" : "the summary was empty";
+            const { text } = await generate();
+            const outcome = isCompleteSummary(stripAppendedState(text)) ? "ok" : text.trim() ? "incomplete" : "empty";
+            attempts.push({ mode, model: label, ms: Date.now() - start, outcome });
+            if (outcome !== "ok") return false;
+            const summary = completeSummary(text, {
+              protectedFacts: checkpoint.protectedFacts,
+              appendix: mode === "cached" ? checkpoint.cachedAppendix : checkpoint.appendix,
+            });
+            const durationMs = Date.now() - started;
+            event.result = {
+              summary,
+              metadata: { smartCompaction: {
+                mode, model: label, durationMs, summaryChars: summary.length, promptChars: prompt.length,
+                ...(typeof plan === "string" ? { cacheSkipped: plan } : {}),
+                attempts,
+              } },
+            };
+            console.info(`[${PLUGIN_ID}] checkpoint: mode=${mode} model=${label} attempts=${attempts.length} ${(durationMs / 1_000).toFixed(1)}s summary=${summary.length} chars${skipped}`);
+            return true;
           } catch (error) {
+            attempts.push({ mode, model: label, ms: Date.now() - start, outcome: errorMessage(error) });
             if (isFatalGenerationError(error)) throw error;
-            problem = String(error);
+            return false;
           }
+        };
+        if (typeof plan !== "string") {
+          if (await attempt("cached", event.model, checkpoint.cachedPrompt, async () => {
+            const request = { maxTokens: plan.maxTokens, prompt: checkpoint.cachedPrompt, model: modelLabel(event.model) };
+            inFlight.set(event.sessionID, request);
+            try {
+              return await ctx.session.generate({ sessionID: event.sessionID, prompt: checkpoint.cachedPrompt });
+            } finally {
+              if (inFlight.get(event.sessionID) === request) inFlight.delete(event.sessionID);
+            }
+          })) return;
         }
-        warn(`using OpenCode's compaction: ${problem}`);
+        for (const model of summaryModels(event.model, session.model)) {
+          if (await attempt("stateless", model, checkpoint.prompt, () => ctx.generate.text({ prompt: checkpoint.prompt, model }))) return;
+        }
+        warn(`using OpenCode's compaction: ${attemptList(attempts)}${skipped}`);
       } catch (error) {
-        warn(`using OpenCode's compaction: ${String(error)}`);
+        warn(`using OpenCode's compaction: ${attemptList(attempts) || errorMessage(error)}`);
       }
     });
 
@@ -110,11 +168,22 @@ export default {
         trimRecentContext(event.messages, maxRecentTokens);
       });
     }
+    if (maxRecentTokens > 0 || cacheReuse) {
+      await ctx.session.hook("generate", (event) => {
+        if (maxRecentTokens > 0) trimRecentContext(event.messages, maxRecentTokens);
+        const request = inFlight.get(event.sessionID);
+        const last = event.messages.at(-1);
+        const part = last?.content[0];
+        if (!request || last?.role !== "user" || last.content.length !== 1 || part?.type !== "text" || part.text !== request.prompt) return;
+        if (modelLabel(event.model) !== request.model) throw new Error("session model changed since the cached-path check");
+        event.options.maxTokens = Math.min(event.options.maxTokens ?? request.maxTokens, request.maxTokens);
+      });
+    }
 
     const threshold = readThresholdConfig(ctx.options);
     return subscribe(
       ctx,
-      threshold ? [shells.handle, createThresholdWatcher(ctx, threshold, warn)] : [shells.handle],
+      [shells.handle, cache.handle, threshold ? createThresholdWatcher(ctx, threshold, warn, limits) : limits.handle],
       warn,
     );
   },

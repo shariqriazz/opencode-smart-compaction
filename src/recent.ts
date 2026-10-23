@@ -165,7 +165,7 @@ export function trimRecentContext(messages: Message[], maxTokens: number): numbe
       const recentStart = part.text.indexOf(RECENT_OPEN);
       const recentEnd = part.text.lastIndexOf(RECENT_CLOSE);
       if (recentStart === -1 || recentEnd <= recentStart) return part;
-      if (!summarizesRecent(part.text.slice(0, recentStart))) return part;
+      if (!summarizesRecent(parseCheckpoint(part.text)?.summary)) return part;
       const bodyStart = recentStart + RECENT_OPEN.length;
       const bounded = boundRecent(part.text.slice(bodyStart, recentEnd), maxTokens * CHARS_PER_TOKEN);
       if (bounded === undefined) return part;

@@ -8,6 +8,7 @@
 
 import type { Plugin } from "@opencode/plugin";
 import type { ServerEvent } from "./events.ts";
+import { createModelLimits } from "./model-limits.ts";
 
 export type ThresholdMode = "percent" | "hard" | "hybrid";
 
@@ -53,7 +54,7 @@ export function contextTokens(tokens: TokenUsage): number {
 type Context = Pick<Plugin.Context, "model" | "session">;
 
 /** Returns an event handler that requests compaction when a session step reaches the threshold. */
-export function createThresholdWatcher(ctx: Context, config: ThresholdConfig, warn: (message: string) => void) {
+export function createThresholdWatcher(ctx: Context, config: ThresholdConfig, warn: (message: string) => void, limits = createModelLimits(ctx)) {
   const models = new Map<string, string>();
   // Sessions with a compaction requested or running, and sessions whose last compaction failed. A failed session is
   // left to OpenCode's own threshold until a compaction succeeds, so a failing compaction is not retried every step.
@@ -61,25 +62,13 @@ export function createThresholdWatcher(ctx: Context, config: ThresholdConfig, wa
   const failed = new Set<string>();
   const generations = new Map<string, number>();
   const advance = (sessionID: string) => generations.set(sessionID, (generations.get(sessionID) ?? 0) + 1);
-  let windows: Promise<Map<string, number>> | undefined;
-
-  const windowOf = async (model: string) => {
-    windows ??= ctx.model
-      .list()
-      .then((result) => new Map(result.data.map((item) => [`${item.providerID}/${item.id}`, item.limit.input || item.limit.context])));
-    try {
-      return (await windows).get(model) ?? 0;
-    } catch (error) {
-      windows = undefined;
-      throw error;
-    }
-  };
 
   const check = async (sessionID: string, tokens: TokenUsage) => {
     const model = models.get(sessionID);
     if (!model || pending.has(sessionID) || failed.has(sessionID)) return;
     const generation = generations.get(sessionID) ?? 0;
-    const limit = thresholdTokens(config, await windowOf(model));
+    const modelLimits = await limits.get(model);
+    const limit = thresholdTokens(config, modelLimits?.input || modelLimits?.context || 0);
     const used = contextTokens(tokens);
     if (limit === undefined || used < limit || pending.has(sessionID) || failed.has(sessionID)
       || (generations.get(sessionID) ?? 0) !== generation || models.get(sessionID) !== model) return;
@@ -93,6 +82,7 @@ export function createThresholdWatcher(ctx: Context, config: ThresholdConfig, wa
   };
 
   return (event: ServerEvent) => {
+    limits.handle(event);
     switch (event.type) {
       case "session.step.started":
         models.set(event.data.sessionID, `${event.data.model.providerID}/${event.data.model.id}`);
@@ -118,10 +108,6 @@ export function createThresholdWatcher(ctx: Context, config: ThresholdConfig, wa
         models.delete(event.data.sessionID);
         pending.delete(event.data.sessionID);
         failed.delete(event.data.sessionID);
-        break;
-      case "model.updated":
-      case "provider.updated":
-        windows = undefined;
         break;
     }
   };

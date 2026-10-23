@@ -4,7 +4,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
-import { buildCheckpoint, completeSummary, isCompleteSummary, RETAINED_IDENTIFIERS_HEADING, semanticSummary } from "../src/checkpoint.ts";
+import { buildCheckpoint, completeSummary, isCompleteSummary, RETAINED_IDENTIFIERS_HEADING, semanticSummary, stripAppendedState } from "../src/checkpoint.ts";
+import { cacheReusePlan, createCacheTracker } from "../src/cache.ts";
+import { createModelLimits } from "../src/model-limits.ts";
 import { getGitEngineeringState } from "../src/git-state.ts";
 import { parseCheckpoint, readSessionFacts, summarizesRecent } from "../src/session.ts";
 import { extractProtectedFacts, formatFileOperationsXml } from "../src/prompt.ts";
@@ -155,6 +157,83 @@ test("a finished summary gets dropped identifiers back verbatim and the exact fi
   assert.ok(!done.includes("- kept"), "facts already present are not repeated");
   assert.equal(semanticSummary(done).includes(open(TOUCHED)), false);
   assert.equal(completeSummary(`has ${SHA}`, { protectedFacts: [SHA], appendix: "" }), `has ${SHA}`);
+});
+
+test("completion replaces every reserved state block before restoring protected facts", () => {
+  const tags = ["read-files", "touched-files", "uncommitted-dirty-files", "modified-lockfiles-and-assets", "active-background-processes", "running-subagents", "uncommitted-diff", "uncommitted-state-unavailable", "recent-context-summarized"];
+  const appendix = formatFileOperationsXml({
+    readFiles: ["ours-read.ts"], touchedModifiedFiles: ["ours-touch.ts"], activeDirtyFiles: ["ours-dirty.ts"],
+    lockfilesAndGeneratedAssets: ["ours.lock"], activeBackgroundProcesses: ["ours-shell"], runningSubagents: ["ses_ours: ours"],
+    dirtyPatch: "ours-diff", dirtyStateAvailable: false, recentSummarized: true,
+  });
+  const copied = tags.map((tag, index) => index % 2
+    ? `<${tag}>copied ${SHA}</${tag}>`
+    : `<${tag}>\ncopied ${SHA}\n  </${tag}>`).join("\n\n\n\n");
+  const text = `Summary\n\n${copied}\n\n<uncommitted-state-unavailable reason="copied"/>\n<read-files>copied first line\nmore copied\n</read-files>\n\nStill working.\n\n\n\n`;
+  const done = completeSummary(text, { protectedFacts: [SHA], appendix });
+  assert.doesNotMatch(done, /copied|\n\n\n/);
+  assert.ok(done.includes(`${RETAINED_IDENTIFIERS_HEADING}\n- ${SHA}`), "facts inside discarded blocks are restored after stripping");
+  assert.ok(done.endsWith(appendix));
+  for (const tag of tags) assert.equal(done.match(new RegExp(`<${tag}(?=[\\s/>])`, "g"))?.length, 1, `${tag} appears only in our appendix`);
+  const noCoverage = completeSummary("Summary\n<recent-context-summarized>copied</recent-context-summarized>", { protectedFacts: [], appendix: "" });
+  assert.doesNotMatch(noCoverage, /recent-context-summarized/, "a model cannot grant coverage when our appendix does not");
+  assert.equal(completeSummary("Summary\r\n<read-files>\r\ncopied\r\n</read-files>\r\nEnd", { protectedFacts: [], appendix: "" }).includes("copied"), false);
+});
+
+test("completion preserves fenced examples, inline mentions, and incomplete or unrelated tags", () => {
+  for (const fence of ["```xml", "~~~~xml"]) {
+    const end = fence.startsWith("`") ? "````" : "~~~~~";
+    const example = `${fence}\n<read-files>\nexample.ts\n\n\n\n</read-files>\n<recent-context-summarized>example</recent-context-summarized>\n${end}`;
+    const inline = "Mention <touched-files>inline.ts</touched-files> here.";
+    const unfinished = "<uncommitted-diff>\nNo closing tag";
+    const unrelated = "<read-files-extra>not reserved</read-files-extra>";
+    const done = completeSummary(`${example}\n\n${inline}\n${unrelated}\n${unfinished}`, { protectedFacts: [], appendix: "" });
+    for (const kept of [example, inline, unfinished, unrelated]) assert.ok(done.includes(kept));
+  }
+});
+
+test("completion closes unterminated backtick and tilde fences before appending state", () => {
+  const marker = formatFileOperationsXml({ recentSummarized: true });
+  for (const fence of ["```", "````", "~~~~"]) {
+    const text = `Summary\n\n${fence}xml${marker}`;
+    assert.equal(stripAppendedState(text), `${text}\n${fence}`, "the original fence length and character close the example");
+    const withoutAppendix = completeSummary(text, { protectedFacts: [], appendix: "" });
+    assert.equal(withoutAppendix, `${text}\n${fence}`);
+    assert.equal(summarizesRecent(withoutAppendix), false, "a copied marker in an open fence cannot become the final block");
+    const withAppendix = completeSummary(text, { protectedFacts: [], appendix: marker });
+    assert.equal(withAppendix, `${text}\n${fence}${marker}`, "our appendix is outside the repaired fence");
+    assert.equal(summarizesRecent(withAppendix), true);
+  }
+});
+
+test("completion preserves space- and tab-indented reserved-tag code examples", () => {
+  for (const indent of ["    ", "\t"]) {
+    const example = `${indent}<read-files>\n${indent}example.ts\n${indent}</read-files>`;
+    const text = `Summary\n\n${example}\n\nStill working.`;
+    assert.equal(stripAppendedState(text), text);
+    assert.equal(completeSummary(text, { protectedFacts: [], appendix: "" }), text);
+  }
+});
+
+test("cached prompts share retention and format without repeating the session transcript", () => {
+  for (const previousSummary of [undefined, "previous semantic text"]) {
+    const checkpoint = buildCheckpoint({
+      previousSummary, userTexts: [`Ship ${SHA}`], transcript: "unique live transcript text", readFiles: [], modifiedFiles: [],
+    }, noGit, { cachedRecentSummarized: true });
+    assert.match(checkpoint.cachedPrompt, /ENTIRE conversation above, including the most recent turns/);
+    assert.match(checkpoint.cachedPrompt, /Stop working on the task, do not call tools/);
+    assert.match(checkpoint.cachedPrompt, /recent-context-summarized marker.*must not be copied/);
+    assert.ok(checkpoint.cachedPrompt.includes(`<protected-facts>\n${SHA}\n</protected-facts>`));
+    assert.doesNotMatch(checkpoint.cachedPrompt, /unique live transcript text|previous semantic text|<conversation>|<previous-summary>/);
+    assert.ok(isCompleteSummary(checkpoint.cachedPrompt.slice(checkpoint.cachedPrompt.indexOf("## 1."))), "the same six-section format is requested");
+    if (previousSummary) {
+      assert.match(checkpoint.cachedPrompt, /previous checkpoint is the <conversation-checkpoint> at the start/);
+      assert.match(checkpoint.cachedPrompt, /HIERARCHICAL RETENTION RULES/);
+      assert.match(checkpoint.cachedPrompt, /length of <conversation-checkpoint>/);
+    }
+    assert.equal(summarizesRecent(`summary${checkpoint.appendix}`), false);
+    assert.equal(summarizesRecent(`summary${checkpoint.cachedAppendix}`), true);
+  }
 });
 
 test("dirty-file and generated-asset appendices are bounded with explicit omission counts", () => {
@@ -395,7 +474,13 @@ test("threshold checks discard token usage when compaction changes during a mode
   }
 });
 
-async function loadHooks(generate: Generate, events: unknown[] = [], context: unknown[] | Error | (() => unknown[]) = [], options: Record<string, unknown> = {}) {
+interface HookFakes {
+  sessionModel?: { providerID: string; id: string; variant?: string };
+  sessionGenerate?: (input: { sessionID: string; prompt: string }, hooks: Map<string, CompactionHook>) => Promise<{ text: string }>;
+  modelList?: () => Promise<{ data: unknown[] }>;
+}
+
+async function loadHooks(generate: Generate, events: unknown[] = [], context: unknown[] | Error | (() => unknown[]) = [], options: Record<string, unknown> = {}, fakes: HookFakes = {}) {
   const hooks = new Map<string, CompactionHook>();
   const ctx = {
     location: { directory: os.tmpdir() },
@@ -410,12 +495,17 @@ async function loadHooks(generate: Generate, events: unknown[] = [], context: un
         hooks.set(name, callback);
         return { dispose: async () => {} };
       },
-      get: async () => ({ location: { directory: os.tmpdir() }, model: { providerID: "cliproxy", id: "factory/claude-sonnet-5-5" } }),
+      get: async () => ({ location: { directory: os.tmpdir() }, model: fakes.sessionModel ?? { providerID: "cliproxy", id: "factory/claude-sonnet-5-5" } }),
       context: async () => {
         if (context instanceof Error) throw context;
         return typeof context === "function" ? context() : context;
       },
+      generate: async (input: { sessionID: string; prompt: string }) => {
+        assert.ok(fakes.sessionGenerate, "unexpected session.generate call");
+        return fakes.sessionGenerate(input, hooks);
+      },
     },
+    model: { list: fakes.modelList ?? (async () => ({ data: [] })) },
     generate: { text: generate },
   };
   const stop = await plugin.setup(ctx as never);
@@ -434,7 +524,418 @@ const compactionEvent = () => ({
   sessionID: "ses_1",
   model: { providerID: "cliproxy", id: "factory/claude-opus-5-5", variant: "high" },
   messages: [user(`Ship ${SHA}`), call("1", "edit", { path: "src/app.ts" })],
-  result: undefined as { summary: string } | undefined,
+  result: undefined as { summary: string; metadata?: { smartCompaction: {
+    mode: string; model: string; durationMs: number; summaryChars: number; promptChars: number; cacheSkipped?: string;
+    attempts: { mode: string; model: string; ms: number; outcome: string }[];
+  } } } | undefined,
+});
+
+test("cache eligibility rejects each unsafe or uneconomical path and budgets all context tokens", () => {
+  const model = { providerID: "p", id: "m", variant: "high" };
+  const measured = {
+    id: "measured", type: "assistant", time: { created: 1, completed: 2 }, content: [
+      { type: "tool", id: "read", name: "read", state: { status: "completed", input: {}, content: [{ type: "text", text: "r".repeat(100) }] } },
+    ],
+  };
+  const later = { id: "later", type: "user", text: "Continue" };
+  const base: Parameters<typeof cacheReusePlan>[0] = {
+    enabled: true, model, context: [measured, later] as never, now: 1_000_000, prompt: "123456789",
+    step: { model: "p/m#high", startedAt: 999_999, assistantMessageID: "measured", tokens: { input: 20_000, output: 3_000, reasoning: 1_000, cache: { read: 40_000, write: 2_000 } } },
+    limits: { context: 100_000, input: 90_000, output: 64_000 },
+  };
+  const plan = (overrides: Partial<typeof base>) => cacheReusePlan({ ...base, ...overrides });
+  // 127 result characters + 46 later-message characters add ceil(173/4) = 44 pending tokens.
+  assert.deepEqual(plan({}), { maxTokens: 25_953 }, "all five token counts, 44 pending tokens, ceil(prompt/4), and 8k safety count");
+  for (const [overrides, reason] of [
+    [{ enabled: false }, "disabled"],
+    [{ model: { ...model, providerID: "other" } }, "model-mismatch"],
+    [{ model: { ...model, id: "other" } }, "model-mismatch"],
+    [{ model: { ...model, variant: undefined } }, "model-mismatch"],
+    [{ model: { ...model, variant: "low" } }, "model-mismatch"],
+    [{ context: undefined }, "context-unavailable"],
+    [{ context: [{ type: "assistant", time: { created: 1 }, content: [] }] }, "incomplete-assistant"],
+    [{ context: [{ type: "assistant", time: { completed: 1 } }, { type: "assistant", time: {} }] }, "incomplete-assistant"],
+    [{ step: undefined }, "no-recent-step"],
+    [{ step: { ...base.step!, model: "p/other#high" } }, "model-mismatch"],
+    [{ step: { ...base.step!, startedAt: base.now - 270_000 } }, "cache-expired"],
+    [{ step: { ...base.step!, tokens: { ...base.step!.tokens, cache: { read: 0, write: 0 } } } }, "cache-cold"],
+    [{ context: [] }, "step-not-in-context"],
+    [{ step: { ...base.step!, assistantMessageID: "missing" } }, "step-not-in-context"],
+    [{ limits: undefined }, "unknown-model-window"],
+    [{ limits: { context: 0, input: 0 } }, "unknown-model-window"],
+    [{ limits: { context: 78_142 } }, "insufficient-room"],
+  ] as [Partial<typeof base>, string][]) assert.equal(plan(overrides), reason);
+  assert.deepEqual(plan({ limits: { context: 78_143 } }), { maxTokens: 4_096 }, "exact minimum room includes the 44 pending tokens");
+  assert.deepEqual(plan({ limits: { context: 0, input: 100_000, output: 10_000 } }), { maxTokens: 10_000 }, "input is the fallback window and output is capped");
+  assert.deepEqual(plan({ limits: { context: 200_000, output: 0 } }), { maxTokens: 32_000 });
+  assert.deepEqual(plan({ limits: { context: 200_000, output: -1 } }), { maxTokens: 32_000 });
+  assert.deepEqual(plan({ step: { ...base.step!, startedAt: base.now - 269_999 } }), { maxTokens: 25_953 });
+  assert.deepEqual(plan({ context: [{ ...measured, time: { completed: 0 } }, later] as never }), { maxTokens: 25_953 }, "completion is tested for presence, not truthiness");
+  assert.deepEqual(plan({ step: { ...base.step!, tokens: { ...base.step!.tokens, cache: { read: 0, write: 42_000 } } } }), { maxTokens: 25_953 }, "cache writes also warm the prefix");
+});
+
+test("cache budgeting counts unmeasured tool results, errors, and every message after the measured assistant", () => {
+  const measured = {
+    id: "measured", type: "assistant", time: { created: 1, completed: 2 }, content: [
+      { type: "text", text: "already measured".repeat(20_000) },
+      { type: "tool", id: "ok", name: "read", state: { status: "completed", input: { alreadyMeasured: "x".repeat(50_000) }, content: [{ type: "text", text: "r".repeat(1_200) }] } },
+      { type: "tool", id: "failed", name: "shell", state: { status: "error", input: {}, content: [{ type: "text", text: "e".repeat(700) }], error: { type: "tool.failed", message: "failure".repeat(100) } } },
+      { type: "tool", id: "no-content", name: "shell", state: { status: "error", input: {}, error: { type: "tool.failed", message: "no content" } } },
+      { type: "tool", id: "running", name: "shell", state: { status: "running", input: {} } },
+    ],
+  };
+  const base: Parameters<typeof cacheReusePlan>[0] = {
+    enabled: true, model: { providerID: "p", id: "m" }, now: 1, prompt: "123456789",
+    step: { model: "p/m#", startedAt: 0, assistantMessageID: "measured", tokens: { input: 79_000, output: 0, reasoning: 0, cache: { read: 1_000, write: 0 } } },
+    limits: { context: 100_000 },
+    context: [
+      { id: "before", type: "user", text: "already measured".repeat(20_000) }, measured,
+      { id: "after-user", type: "user", text: "u".repeat(1_025) },
+      { id: "after-synthetic", type: "synthetic", text: "s".repeat(2_049), metadata: { source: "subagent" } },
+    ] as never,
+  };
+  // Serialized lengths: 1227 + 727 + 735 + 45 + 1068 + 2135 = 5937 chars, or 1485 tokens.
+  assert.deepEqual(cacheReusePlan(base), { maxTokens: 10_512 });
+  assert.deepEqual(cacheReusePlan({ ...base, context: [{ ...measured, content: [] }] as never }), { maxTokens: 11_997 }, "already-measured history, text, and tool inputs are not counted twice");
+  assert.equal(cacheReusePlan({ ...base, context: [{ ...measured, content: [
+    { type: "tool", id: "large", name: "read", state: { status: "completed", input: {}, content: [{ type: "text", text: "large".repeat(20_000) }] } },
+  ] }] as never }), "insufficient-room", "a large unmeasured tool result can exhaust the context window");
+});
+
+test("cache budgeting respects a smaller input limit even when the context window has room", () => {
+  const base: Parameters<typeof cacheReusePlan>[0] = {
+    enabled: true, model: { providerID: "p", id: "m" }, now: 1, prompt: "123456789",
+    step: { model: "p/m#", startedAt: 0, assistantMessageID: "measured", tokens: { input: 79_000, output: 0, reasoning: 0, cache: { read: 1_000, write: 0 } } },
+    limits: { context: 200_000, input: 100_000 },
+    context: [
+      { id: "measured", type: "assistant", time: { completed: 1 }, content: [] },
+      { id: "later", type: "user", text: "x".repeat(80_000) },
+    ] as never,
+  };
+  assert.equal(cacheReusePlan(base), "insufficient-room");
+  assert.deepEqual(cacheReusePlan({ ...base, limits: { context: 200_000, input: 0 } }), { maxTokens: 32_000 });
+  // The later message is 80038 JSON characters: projected + safety = 80000 + 20010 + 3 + 8000.
+  assert.deepEqual(cacheReusePlan({ ...base, limits: { context: 200_000, input: 108_013 } }), { maxTokens: 32_000 }, "exact input margin is allowed");
+  assert.equal(cacheReusePlan({ ...base, limits: { context: 200_000, input: 108_012 } }), "insufficient-room");
+});
+
+test("the cache tracker uses the latest ended step and clears coverage on compaction and deletion", () => {
+  const tracker = createCacheTracker();
+  const handle = (event: unknown) => tracker.handle(event as never);
+  const start = (sessionID: string, id = "m") => handle({ type: "session.step.started", data: { sessionID, model: { providerID: "p", id } } });
+  const end = (sessionID: string, read = 10) => handle({ type: "session.step.ended", data: { sessionID, assistantMessageID: `assistant-${sessionID}-${read}`, tokens: { input: 1, output: 2, reasoning: 3, cache: { read, write: 0 } } } });
+  const before = Date.now();
+  start("one"); start("two", "other"); end("one"); end("two");
+  assert.equal(tracker.get("one")?.model, "p/m#");
+  assert.equal(tracker.get("two")?.model, "p/other#");
+  assert.equal(tracker.get("one")?.assistantMessageID, "assistant-one-10");
+  assert.ok(tracker.get("one")!.startedAt >= before && tracker.get("one")!.startedAt <= Date.now());
+  end("one", 0);
+  assert.equal(tracker.get("one")?.tokens.cache.read, 0, "a newer cold step replaces the old warm one");
+  assert.equal(tracker.get("one")?.assistantMessageID, "assistant-one-0");
+  handle({ type: "session.compaction.ended", data: { sessionID: "one" } });
+  assert.equal(tracker.get("one"), undefined);
+  assert.ok(tracker.get("two"), "sessions are isolated");
+  handle({ type: "session.deleted", data: { sessionID: "two" } });
+  end("two");
+  assert.equal(tracker.get("two"), undefined, "deletion clears the remembered model too");
+});
+
+test("model limits are cached across threshold and cache-reuse reads, invalidated, and retried after errors", async () => {
+  let reads = 0;
+  const ctx = {
+    model: { list: async () => { reads++; return { data: [{ providerID: "p", id: "m", limit: { context: 100, input: 90, output: 50 } }] }; } },
+    session: { compact: async () => {} },
+  };
+  const limits = createModelLimits(ctx as never);
+  const handle = createThresholdWatcher(ctx as never, { mode: "percent", percent: 95, hardLimitTokens: 600_000 }, assert.fail, limits);
+  handle({ type: "session.step.started", data: { sessionID: "ses_limits", model: { providerID: "p", id: "m" } } } as never);
+  handle({ type: "session.step.ended", data: { sessionID: "ses_limits", tokens: { input: 1, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } } } as never);
+  assert.equal((await limits.get("p/m"))?.output, 50);
+  assert.equal(reads, 1);
+  for (const type of ["model.updated", "provider.updated"]) {
+    handle({ type } as never);
+    await limits.get("p/m");
+  }
+  assert.equal(reads, 3);
+  let failures = 0;
+  const retry = createModelLimits({ model: { list: async () => {
+    if (++failures === 1) throw new Error("registry offline");
+    return { data: [] };
+  } } } as never);
+  await assert.rejects(retry.get("p/m"), /registry offline/);
+  assert.equal(await retry.get("p/m"), undefined);
+  assert.equal(failures, 2);
+});
+
+const CACHE_MODEL = compactionEvent().model;
+const warmSteps = () => [
+  { type: "session.step.started", data: { sessionID: "ses_1", model: CACHE_MODEL } },
+  { type: "session.step.ended", data: { sessionID: "ses_1", assistantMessageID: "latest", tokens: { input: 5_000, output: 1_000, reasoning: 500, cache: { read: 80_000, write: 1_000 } } } },
+];
+const cachedFakes: HookFakes = {
+  sessionModel: CACHE_MODEL,
+  modelList: async () => ({ data: [{ ...CACHE_MODEL, limit: { context: 200_000, input: 100_000, output: 12_000 } }] }),
+};
+const completedContext = [{ id: "latest", type: "assistant", time: { created: 1, completed: 2 }, content: [{ type: "text", text: "latest session turn" }] }];
+
+test("eligible compaction reuses the session and caps generation only while its own call is in flight", async () => {
+  let prompt = "";
+  const infos: string[] = [];
+  const info = console.info;
+  console.info = (message: string) => infos.push(message);
+  try {
+    const hooks = await loadHooks(async () => assert.fail("stateless generation should not run"), warmSteps(), completedContext, {}, {
+      ...cachedFakes,
+      sessionGenerate: async (input, registered) => {
+        assert.equal(input.sessionID, "ses_1");
+        prompt = input.prompt;
+        for (const [existing, expected] of [[undefined, 12_000], [8_000, 8_000], [40_000, 12_000]]) {
+          const request = { sessionID: "ses_1", model: CACHE_MODEL, messages: [user(input.prompt)], options: { maxTokens: existing, temperature: 0.2 } };
+          await registered.get("generate")!(request);
+          assert.deepEqual(request.options, { maxTokens: expected, temperature: 0.2 });
+        }
+        const other = { sessionID: "ses_other", messages: [], options: { maxTokens: 40_000 } };
+        await registered.get("generate")!(other);
+        assert.equal(other.options.maxTokens, 40_000);
+        for (const messages of [[], [user("another generation")], [{ role: "assistant", content: [{ type: "text", text: input.prompt }] }], [user(input.prompt), user("another generation")]]) {
+          const unrelated = { sessionID: "ses_1", model: { ...CACHE_MODEL, variant: "different" }, messages, options: { maxTokens: 40_000 } };
+          await registered.get("generate")!(unrelated);
+          assert.equal(unrelated.options.maxTokens, 40_000, "only our last user prompt is correlated, even in the same session");
+        }
+        return { text: `${SIX_SECTIONS}\n\n<recent-context-summarized>copied marker</recent-context-summarized>` };
+      },
+    });
+    const outside = () => ({ sessionID: "ses_1", model: CACHE_MODEL, messages: [user(prompt)], options: { maxTokens: 40_000 } });
+    const before = outside();
+    await hooks.get("generate")!(before);
+    assert.equal(before.options.maxTokens, 40_000);
+    const event = compactionEvent();
+    await hooks.get("compaction")!(event);
+    const after = outside();
+    await hooks.get("generate")!(after);
+    assert.equal(after.options.maxTokens, 40_000);
+    assert.ok(event.result);
+    assert.ok(summarizesRecent(event.result.summary), "cached history covers the kept turns even with no adapted boundary");
+    assert.equal(event.result.summary.match(/<recent-context-summarized>/g)?.length, 1);
+    assert.doesNotMatch(event.result.summary, /copied marker/);
+    assert.ok(prompt.includes(SHA));
+    assert.doesNotMatch(prompt, /\[User\]: Ship|latest session turn|<conversation>/);
+    const diagnostic = event.result.metadata!.smartCompaction;
+    assert.equal(diagnostic.mode, "cached");
+    assert.equal(diagnostic.model, "cliproxy/factory/claude-opus-5-5#high");
+    assert.equal(diagnostic.promptChars, prompt.length);
+    assert.equal(diagnostic.summaryChars, event.result.summary.length);
+    assert.ok(diagnostic.durationMs >= 0);
+    assert.equal(diagnostic.cacheSkipped, undefined);
+    assert.deepEqual(diagnostic.attempts.map(({ mode, model, outcome }) => ({ mode, model, outcome })), [{ mode: "cached", model: diagnostic.model, outcome: "ok" }]);
+    assert.ok(diagnostic.attempts[0]!.ms >= 0);
+    assert.doesNotMatch(JSON.stringify(diagnostic), /Ship|ship it|1234567890abcdef/);
+    assert.equal(infos.length, 1);
+    assert.match(infos[0]!, /checkpoint: mode=cached model=.* attempts=1 \d+\.\d+s summary=\d+ chars$/);
+    assert.doesNotMatch(infos[0]!, /Ship|ship it|1234567890abcdef/);
+  } finally {
+    console.info = info;
+  }
+});
+
+test("a correlated generate request on a changed model falls back to stateless with a diagnostic attempt", async () => {
+  for (const changed of [{ ...CACHE_MODEL, variant: "low" }, { ...CACHE_MODEL, id: "another" }, { ...CACHE_MODEL, providerID: "another" }]) {
+    let stateless = 0;
+    const hooks = await loadHooks(async () => { stateless++; return { text: SIX_SECTIONS }; }, warmSteps(), completedContext, {}, {
+      ...cachedFakes,
+      sessionGenerate: async (input, registered) => {
+        await registered.get("generate")!({ sessionID: input.sessionID, model: changed, messages: [user(input.prompt)], options: {} });
+        return { text: SIX_SECTIONS };
+      },
+    });
+    const event = compactionEvent();
+    await hooks.get("compaction")!(event);
+    assert.equal(stateless, 1);
+    assert.equal(event.result?.metadata?.smartCompaction.mode, "stateless");
+    assert.deepEqual(event.result?.metadata?.smartCompaction.attempts.map(({ mode, outcome }) => ({ mode, outcome })), [
+      { mode: "cached", outcome: "session model changed since the cached-path check" },
+      { mode: "stateless", outcome: "ok" },
+    ]);
+  }
+});
+
+test("an older cached call finishing does not clear a newer in-flight entry for the same session", async () => {
+  const deferred = <T>() => {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((done) => { resolve = done; });
+    return { promise, resolve };
+  };
+  const calls = [
+    { started: deferred<string>(), reply: deferred<{ text: string }>() },
+    { started: deferred<string>(), reply: deferred<{ text: string }>() },
+  ];
+  let count = 0;
+  const hooks = await loadHooks(async () => assert.fail("overlapping calls should both use the cached path"), warmSteps(), completedContext, {}, {
+    ...cachedFakes,
+    sessionGenerate: async (input) => {
+      const call = calls[count++]!;
+      call.started.resolve(input.prompt);
+      return call.reply.promise;
+    },
+  });
+  const first = compactionEvent();
+  const second = compactionEvent();
+  second.messages = [user("Ship https://second.example.com"), call("2", "edit", { path: "src/second.ts" })];
+  let firstRun: Promise<void> | undefined;
+  let secondRun: Promise<void> | undefined;
+  const request = (prompt: string) => ({ sessionID: "ses_1", model: CACHE_MODEL, messages: [user(prompt)], options: { maxTokens: 40_000 } });
+  try {
+    firstRun = hooks.get("compaction")!(first);
+    const firstPrompt = await calls[0]!.started.promise;
+    secondRun = hooks.get("compaction")!(second);
+    const secondPrompt = await calls[1]!.started.promise;
+    assert.notEqual(firstPrompt, secondPrompt);
+    const older = request(firstPrompt);
+    await hooks.get("generate")!(older);
+    assert.equal(older.options.maxTokens, 40_000, "the current entry belongs to the newer prompt");
+    calls[0]!.reply.resolve({ text: SIX_SECTIONS });
+    await firstRun;
+    const newer = request(secondPrompt);
+    await hooks.get("generate")!(newer);
+    assert.equal(newer.options.maxTokens, 12_000, "the older call's finally must not delete the newer entry");
+    calls[1]!.reply.resolve({ text: SIX_SECTIONS });
+    await secondRun;
+    const after = request(secondPrompt);
+    await hooks.get("generate")!(after);
+    assert.equal(after.options.maxTokens, 40_000, "the newer call clears its own entry");
+    assert.equal(first.result?.metadata?.smartCompaction.mode, "cached");
+    assert.equal(second.result?.metadata?.smartCompaction.mode, "cached");
+  } finally {
+    for (const call of calls) call.reply.resolve({ text: SIX_SECTIONS });
+    await Promise.all([firstRun, secondRun]);
+  }
+});
+
+test("headings inside a removable reserved block are incomplete on both generation paths", async () => {
+  const wrapped = `<read-files>\n${SIX_SECTIONS}\n</read-files>`;
+  assert.equal(isCompleteSummary(wrapped), true, "the fixture would pass validation without stripping");
+  assert.equal(isCompleteSummary(stripAppendedState(wrapped)), false);
+  for (const cacheReuse of [true, false]) {
+    let stateless = 0;
+    const hooks = await loadHooks(async () => {
+      stateless++;
+      return { text: !cacheReuse && stateless === 1 ? wrapped : SIX_SECTIONS };
+    }, warmSteps(), completedContext, { cacheReuse }, { ...cachedFakes, sessionGenerate: async () => ({ text: wrapped }) });
+    const event = compactionEvent();
+    await hooks.get("compaction")!(event);
+    assert.equal(event.result?.metadata?.smartCompaction.mode, "stateless");
+    assert.deepEqual(event.result?.metadata?.smartCompaction.attempts.map(({ mode, outcome }) => ({ mode, outcome })), [
+      { mode: cacheReuse ? "cached" : "stateless", outcome: "incomplete" },
+      { mode: "stateless", outcome: "ok" },
+    ]);
+    assert.ok(event.result?.summary.startsWith(SIX_SECTIONS));
+  }
+});
+
+test("cached incomplete, empty, and retryable errors fall back with both attempts and no leaked token cap", async () => {
+  for (const [reply, outcome] of [
+    ["## 1. Primary Goal\ncut off", "incomplete"],
+    [" ", "empty"],
+    [new Error("offline"), "offline"],
+    [new Error("x".repeat(300)), "x".repeat(200)],
+  ] as const) {
+    let stateless = 0;
+    let cachedPrompt = "";
+    const hooks = await loadHooks(async () => { stateless++; return { text: SIX_SECTIONS }; }, warmSteps(), completedContext, {}, {
+      ...cachedFakes,
+      sessionGenerate: async (input) => { cachedPrompt = input.prompt; if (reply instanceof Error) throw reply; return { text: reply }; },
+    });
+    const event = compactionEvent();
+    await hooks.get("compaction")!(event);
+    assert.equal(stateless, 1);
+    assert.ok(event.result);
+    assert.equal(event.result.metadata!.smartCompaction.mode, "stateless");
+    assert.equal(event.result.metadata!.smartCompaction.cacheSkipped, undefined, "the cached path was tried, not skipped");
+    assert.deepEqual(event.result.metadata!.smartCompaction.attempts.map(({ mode, outcome }) => ({ mode, outcome })), [
+      { mode: "cached", outcome }, { mode: "stateless", outcome: "ok" },
+    ]);
+    assert.equal(summarizesRecent(event.result.summary), false, "stateless fallback retains its stricter adapted-coverage rule");
+    const request = { sessionID: "ses_1", model: CACHE_MODEL, messages: [user(cachedPrompt)], options: { maxTokens: 40_000 } };
+    await hooks.get("generate")!(request);
+    assert.equal(request.options.maxTokens, 40_000);
+  }
+});
+
+test("cacheReuse false disables session generation, while maxRecentTokens zero disables coverage and trimming only", async () => {
+  for (const cacheReuse of [true, false]) {
+    let cached = 0;
+    const hooks = await loadHooks(async () => ({ text: SIX_SECTIONS }), warmSteps(), completedContext, { cacheReuse, maxRecentTokens: 0 }, {
+      ...cachedFakes, sessionGenerate: async () => { cached++; return { text: SIX_SECTIONS }; },
+    });
+    const event = compactionEvent();
+    await hooks.get("compaction")!(event);
+    assert.equal(cached, cacheReuse ? 1 : 0);
+    assert.equal(hooks.has("generate"), cacheReuse);
+    assert.equal(hooks.has("context"), false);
+    assert.equal(summarizesRecent(event.result?.summary), false);
+    assert.equal(event.result?.metadata?.smartCompaction.cacheSkipped, cacheReuse ? undefined : "disabled");
+  }
+  const disabled = await loadHooks(async () => ({ text: SIX_SECTIONS }), warmSteps(), completedContext, { cacheReuse: false }, cachedFakes);
+  assert.equal(disabled.has("generate"), true, "trimming still mirrors the context hook when cache reuse is disabled");
+});
+
+test("the generate hook trims marked checkpoints exactly like the context hook without changing stored messages", async () => {
+  const hooks = await loadHooks(async () => ({ text: SIX_SECTIONS }), [], [], { maxRecentTokens: 75 });
+  const long = Array.from({ length: 30 }, (_, i) => `[User]: turn ${i} ${"x".repeat(100)}`).join("\n");
+  const original = checkpointMessage(summarized("summary"), long);
+  const unmarked = checkpointMessage("unmarked", long);
+  const primary = { messages: [original, unmarked] };
+  const generate = { sessionID: "ses_1", messages: [original, unmarked], options: { maxTokens: 42_000 } };
+  await hooks.get("context")!(primary);
+  await hooks.get("generate")!(generate);
+  assert.deepEqual(generate.messages, primary.messages);
+  assert.ok(generate.messages[0]!.content[0]!.text.includes(RECENT_OMITTED_NOTE));
+  assert.equal(generate.messages[1], unmarked);
+  assert.ok(original.content[0]!.text.includes("turn 0"));
+  assert.equal(generate.options.maxTokens, 42_000);
+});
+
+test("cache guards and fatal errors fail open with concise mode/model/outcome warnings", async () => {
+  const warnings: string[] = [];
+  const warn = console.warn;
+  console.warn = (message: string) => warnings.push(message);
+  try {
+    for (const [context, events, reason] of [
+      [new Error("context offline"), warmSteps(), "context-unavailable"],
+      [[{ type: "assistant", time: { created: 1 }, content: [] }], warmSteps(), "incomplete-assistant"],
+      [completedContext, [...warmSteps(), { type: "session.compaction.ended", data: { sessionID: "ses_1" } }], "no-recent-step"],
+    ] as [unknown[] | Error, unknown[], string][]) {
+      const hooks = await loadHooks(async () => ({ text: SIX_SECTIONS }), events, context, {}, cachedFakes);
+      const event = compactionEvent();
+      await hooks.get("compaction")!(event);
+      assert.equal(event.result?.metadata?.smartCompaction.cacheSkipped, reason);
+    }
+    warnings.length = 0;
+    const hooks = await loadHooks(async () => ({ text: "" }), warmSteps(), completedContext, {}, {
+      ...cachedFakes, sessionGenerate: async () => ({ text: "partial summary" }),
+    });
+    const failed = compactionEvent();
+    await hooks.get("compaction")!(failed);
+    assert.equal(failed.result, undefined);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0]!, /cached\/cliproxy\/factory\/claude-opus-5-5#high: incomplete; stateless\/.*#high: empty; stateless\/.*#: empty/);
+    assert.doesNotMatch(warnings[0]!, /partial summary/);
+    let stateless = 0;
+    const fatal = await loadHooks(async () => { stateless++; return { text: SIX_SECTIONS }; }, warmSteps(), completedContext, {}, {
+      ...cachedFakes, sessionGenerate: async () => { throw new Error("401 Unauthorized"); },
+    });
+    const event = compactionEvent();
+    await fatal.get("compaction")!(event);
+    assert.equal(event.result, undefined);
+    assert.equal(stateless, 0);
+    assert.match(warnings.at(-1)!, /cached\/.*: 401 Unauthorized/);
+    const request = { sessionID: "ses_1", messages: [], options: { maxTokens: 40_000 } };
+    await fatal.get("generate")!(request);
+    assert.equal(request.options.maxTokens, 40_000);
+  } finally {
+    console.warn = warn;
+  }
 });
 
 test("the compaction hook writes the checkpoint with the session's model and completes it", async () => {
@@ -511,8 +1012,50 @@ test("a failed, empty, or incomplete generation leaves OpenCode's own compaction
   await partial(cut);
   assert.equal(cut.result, undefined);
 });
-const summarized = (summary: string) => `${summary}\n\n${open("recent-context-summarized")}\nnote\n${close("recent-context-summarized")}`;
+const summarized = (summary: string) => summary + formatFileOperationsXml({ recentSummarized: true });
 const withID = <T extends object>(id: string, message: T) => ({ id, ...message });
+
+test("coverage requires the exact final emitted marker block after trimming trailing whitespace", () => {
+  const real = summarized("summary");
+  assert.equal(summarizesRecent(real), true);
+  assert.equal(summarizesRecent(`${real}\n \t\r\n`), true);
+  assert.equal(summarizesRecent(undefined), false);
+  assert.equal(summarizesRecent(`${real}\nMore summary text.`), false, "a mid-summary marker grants no coverage");
+  assert.equal(summarizesRecent(`${real}${formatFileOperationsXml({ readFiles: ["later.ts"] })}`), false, "the marker must be the final block");
+  assert.equal(summarizesRecent(`summary\n\n${open("recent-context-summarized")}\nnote\n${close("recent-context-summarized")}`), false, "the marker body must match exactly");
+  assert.equal(summarizesRecent(real.replace("context below", "context BELOW")), false, "the marker is case-sensitive");
+});
+
+test("quoted coverage markers never trim or suppress recent turns without a real final marker", () => {
+  const marker = formatFileOperationsXml({ recentSummarized: true });
+  const recent = `[User]: ${"unsummarized turn ".repeat(200)}latest`;
+  const quotes = [
+    `Summary\n\n\`\`\`xml${marker}\n\`\`\``,
+    `Summary\n\n~~~~xml${marker}\n~~~~`,
+    `Summary${marker}\nMore summary text.`,
+  ];
+  for (const quoted of quotes) {
+    assert.equal(summarizesRecent(quoted), false);
+    const original = checkpointMessage(quoted, recent);
+    const messages = [original] as unknown as Message[];
+    assert.equal(trimRecentContext(messages, 75), 0);
+    assert.equal(messages[0], original, "uncovered request text is unchanged");
+    assert.equal(readSessionFacts([original] as unknown as Messages).transcript, recent, "uncovered recent turns remain in the next compaction transcript");
+    const withoutMarker = completeSummary(quoted, { protectedFacts: [], appendix: "" });
+    assert.equal(summarizesRecent(withoutMarker), false);
+    if (quoted.includes("xml")) assert.equal(withoutMarker, quoted, "fenced examples survive completion verbatim");
+
+    const covered = completeSummary(quoted, { protectedFacts: [], appendix: marker });
+    assert.equal(summarizesRecent(covered), true);
+    const marked = checkpointMessage(`${covered}\n \t`, recent);
+    assert.equal(summarizesRecent(parseCheckpoint(marked.content[0]!.text)?.summary), true, "coverage uses the extracted summary body, not its wrapper");
+    const coveredMessages = [marked] as unknown as Message[];
+    assert.equal(trimRecentContext(coveredMessages, 75), 1);
+    assert.ok((coveredMessages[0] as unknown as typeof marked).content[0]!.text.includes(RECENT_OMITTED_NOTE));
+    assert.equal(readSessionFacts([marked] as unknown as Messages).transcript, "", "the same final-marker rule avoids re-summarizing covered recent turns");
+    assert.ok(readSessionFacts([marked] as unknown as Messages).userTexts.includes(recent.slice("[User]: ".length).trim()), "covered user facts are still protected");
+  }
+});
 
 test("the turns OpenCode keeps verbatim are found by ID and read like the summarized ones", () => {
   const summarizedMessages = [withID("m1", user("start")), withID("m2", call("c1", "read", { path: "/repo/a.ts" }))] as unknown as Messages;
@@ -852,7 +1395,7 @@ test("subagent tracking recovers after a failed scan and completion records move
     if (!context) throw new Error("context temporarily offline");
     return context;
   });
-  const previous = `${summarized(SIX_SECTIONS)}${formatFileOperationsXml({ runningSubagents: ["ses_carried (worker): Earlier work", "ses_active (reviewer): Still working", "ses_early (worker): Already reported"], subagentsVerified: false })}`;
+  const previous = `${SIX_SECTIONS}${formatFileOperationsXml({ runningSubagents: ["ses_carried (worker): Earlier work", "ses_active (reviewer): Still working", "ses_early (worker): Already reported"], subagentsVerified: false, recentSummarized: true })}`;
   const first = compactionEvent();
   first.messages = [checkpointMessage(previous, `[Synthetic context]: ${reported("ses_early").text}`), user("Continue")] as never;
   await hooks.get("compaction")!(first);

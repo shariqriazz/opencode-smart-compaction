@@ -8,6 +8,7 @@
  */
 
 import {
+  cachedCompactionPrompt,
   extractProtectedFacts,
   formatFileOperationsXml,
   sanitizeTagContent,
@@ -60,16 +61,45 @@ const CONVERSATION_CLOSE = "</conversation>";
 
 // Everything from the first appended state block on is regenerated each time,
 // so it is not fed back to the model as part of the previous checkpoint.
-const APPENDED_STATE = /\n\n<(?:read-files|touched-files|uncommitted-dirty-files|modified-lockfiles-and-assets|active-background-processes|running-subagents|uncommitted-diff|uncommitted-state-unavailable|recent-context-summarized)\b/i;
+const APPENDED_STATE = ["read-files", "touched-files", "uncommitted-dirty-files", "modified-lockfiles-and-assets", "active-background-processes", "running-subagents", "uncommitted-diff", "uncommitted-state-unavailable", "recent-context-summarized"];
+const APPENDED_START = new RegExp(`\\n\\n<(?:${APPENDED_STATE.join("|")})\\b`, "i");
+
+/** Remove only whole reserved blocks outside fenced examples; inline mentions are ordinary prose. */
+export function stripAppendedState(text: string): string {
+  const block = new RegExp(`^<(${APPENDED_STATE.join("|")})(?=[\\s/>])[^>\\r\\n]*?(?:/[ \\t]*>|>[\\s\\S]*?</\\1[ \\t]*>)[ \\t]*\\r?$`, "gim");
+  const output: string[] = [];
+  let plain: string[] = [];
+  let fence: string | undefined;
+  const flush = () => {
+    if (plain.length) output.push(...plain.join("\n").replace(block, "").replace(/\n(?:[ \t]*\n){2,}/g, "\n\n").split("\n"));
+    plain = [];
+  };
+  for (const line of text.split("\n")) {
+    const marker = line.replace(/\r$/, "").match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (fence) {
+      output.push(line);
+      if (marker && marker[1]![0] === fence[0] && marker[1]!.length >= fence.length && !marker[2]!.trim()) fence = undefined;
+    } else if (marker && !(marker[1]![0] === "`" && marker[2]!.includes("`"))) {
+      flush();
+      output.push(line);
+      fence = marker[1];
+    } else plain.push(line);
+  }
+  flush();
+  if (fence) output.push(fence);
+  return output.join("\n").trimEnd();
+}
 
 export function semanticSummary(summary: string): string {
-  return summary.split(APPENDED_STATE)[0]!.trim();
+  return summary.split(APPENDED_START)[0]!.trim();
 }
 
 export interface Checkpoint {
   prompt: string;
+  cachedPrompt: string;
   protectedFacts: string[];
   appendix: string;
+  cachedAppendix: string;
 }
 
 /** Session state appended after the summary beside the file and worktree state. */
@@ -79,12 +109,13 @@ export interface CheckpointState {
   subagentsVerified?: boolean;
   /** The summary also covers the turns OpenCode keeps verbatim, so the recent context may be shortened in requests. */
   recentSummarized?: boolean;
+  cachedRecentSummarized?: boolean;
 }
 
 export function buildCheckpoint(
   facts: SessionFacts,
   git: GitEngineeringState,
-  { backgroundProcesses = [], runningSubagents = [], subagentsVerified = true, recentSummarized = false }: CheckpointState = {},
+  { backgroundProcesses = [], runningSubagents = [], subagentsVerified = true, recentSummarized = false, cachedRecentSummarized = false }: CheckpointState = {},
 ): Checkpoint {
   const previousSummary = facts.previousSummary ? semanticSummary(facts.previousSummary) : undefined;
   const protectedFacts = extractProtectedFacts(facts.userTexts, previousSummary);
@@ -96,9 +127,8 @@ export function buildCheckpoint(
   if (previousSummary) {
     sections.push(`<previous-summary>\n${sanitizeTagContent(previousSummary)}\n</previous-summary>`);
   }
-  if (protectedFacts.length > 0) {
-    sections.push(`<protected-facts>\n${protectedFacts.map(sanitizeTagContent).join("\n")}\n</protected-facts>`);
-  }
+  const protectedBlock = protectedFacts.length > 0 ? `<protected-facts>\n${protectedFacts.map(sanitizeTagContent).join("\n")}\n</protected-facts>` : undefined;
+  if (protectedBlock) sections.push(protectedBlock);
   sections.push(previousSummary ? SMART_COMPACTION_UPDATE_PROMPT : SMART_COMPACTION_INITIAL_PROMPT);
 
   const appendix = formatFileOperationsXml({
@@ -111,15 +141,20 @@ export function buildCheckpoint(
     activeBackgroundProcesses: backgroundProcesses,
     runningSubagents,
     subagentsVerified,
-    recentSummarized,
   });
-
-  return { prompt: sections.join("\n\n"), protectedFacts, appendix };
+  const marker = recentSummarized || cachedRecentSummarized ? formatFileOperationsXml({ recentSummarized: true }) : "";
+  return {
+    prompt: sections.join("\n\n"),
+    cachedPrompt: cachedCompactionPrompt(!!previousSummary, protectedBlock),
+    protectedFacts,
+    appendix: appendix + (recentSummarized ? marker : ""),
+    cachedAppendix: appendix + (cachedRecentSummarized ? marker : ""),
+  };
 }
 
 /** Restore dropped protected identifiers verbatim, then append the file and worktree state. */
 export function completeSummary(text: string, checkpoint: Pick<Checkpoint, "protectedFacts" | "appendix">): string {
-  let summary = text.trimEnd();
+  let summary = stripAppendedState(text);
   const dropped = checkpoint.protectedFacts.filter((fact) => fact && !summary.includes(fact));
   if (dropped.length > 0) {
     summary = [summary, "", RETAINED_IDENTIFIERS_HEADING, ...dropped.map((fact) => `- ${fact}`)].join("\n");
